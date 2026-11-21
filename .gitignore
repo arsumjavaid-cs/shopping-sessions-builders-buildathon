@@ -1,0 +1,20 @@
+# Virtual Environments
+venv/
+.venv/
+env/
+
+# Secret API Keys & Environment Variables
+.env
+.env.*
+!.env.example
+
+# Python Cache & Artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# OS & Editor Files
+.DS_Store
+Thumbs.db
+.vscode/
