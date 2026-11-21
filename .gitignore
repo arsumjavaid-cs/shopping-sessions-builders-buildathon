@@ -18,3 +18,10 @@ __pycache__/
 .DS_Store
 Thumbs.db
 .vscode/
+
+
+#According to Rules
+data/
+output/
+*.csv
+*.parquet
