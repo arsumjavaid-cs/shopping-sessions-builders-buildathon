@@ -25,3 +25,10 @@ data/
 output/
 *.csv
 *.parquet
+
+#For checking 1M
+dev/
+dev-answer/
+generator/
+out/
+scratch_tmp/
