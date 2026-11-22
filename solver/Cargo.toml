@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 arrow = { version = "54", default-features = false }
+memchr = "2.7"
 mimalloc = "0.1"
 parquet = { version = "54", default-features = false, features = ["arrow", "snap"] }
 rayon = "1.10"

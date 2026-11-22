@@ -1,6 +1,7 @@
 use arrow::array::{Date32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use memchr::{memchr, memchr_iter};
 use mimalloc::MiMalloc;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
@@ -19,6 +20,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 const SEVEN_DAYS_MS: i64 = 7 * 86_400_000;
 const TWENTY_FOUR_HOURS_MS: i64 = 86_400_000;
 const SESSION_GAP_MS: i64 = 1_800_000;
+const NUM_SHARDS: usize = 128;
 
 #[derive(Deserialize)]
 struct Manifest {
@@ -55,12 +57,12 @@ struct ValidClick<'a> {
 fn parse_strict_field(f: &[u8]) -> Option<&[u8]> {
     if f.len() >= 2 && f.first() == Some(&b'"') && f.last() == Some(&b'"') {
         let inner = &f[1..f.len() - 1];
-        if inner.contains(&b'"') {
+        if memchr(b'"', inner).is_some() {
             return None;
         }
         Some(inner)
     } else {
-        if f.contains(&b'"') {
+        if memchr(b'"', f).is_some() {
             return None;
         }
         Some(f)
@@ -73,23 +75,34 @@ fn split_strict_line<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
         return None;
     }
     let mut out = [&[][..]; N];
-    let mut idx = 0;
     let mut start = 0;
-    for (i, &b) in line.iter().enumerate() {
-        if b == b',' {
-            if idx >= N - 1 {
-                return None;
-            }
-            out[idx] = parse_strict_field(&line[start..i])?;
-            idx += 1;
-            start = i + 1;
-        }
+    for slot in out.iter_mut().take(N - 1) {
+        let rel = memchr(b',', &line[start..])?;
+        *slot = parse_strict_field(&line[start..start + rel])?;
+        start += rel + 1;
     }
-    if idx != N - 1 {
+    if memchr(b',', &line[start..]).is_some() {
         return None;
     }
-    out[idx] = parse_strict_field(&line[start..])?;
+    out[N - 1] = parse_strict_field(&line[start..])?;
     Some(out)
+}
+
+#[inline(always)]
+fn for_each_csv_line<'a, F: FnMut(&'a [u8])>(bytes: &'a [u8], mut f: F) {
+    let Some(first_nl) = memchr(b'\n', bytes) else {
+        return;
+    };
+    let base = first_nl + 1;
+    let mut start = base;
+    for rel_nl in memchr_iter(b'\n', &bytes[base..]) {
+        let end = base + rel_nl;
+        f(&bytes[start..end]);
+        start = end + 1;
+    }
+    if start < bytes.len() {
+        f(&bytes[start..]);
+    }
 }
 
 #[inline(always)]
@@ -99,35 +112,41 @@ fn parse_ascii_digits_u64(s: &[u8]) -> Option<u64> {
     }
     let mut val: u64 = 0;
     for &b in s {
-        if !b.is_ascii_digit() {
+        let d = b.wrapping_sub(b'0');
+        if d > 9 {
             return None;
         }
-        val = val.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+        val = val.checked_mul(10)?.checked_add(d as u64)?;
     }
     Some(val)
 }
 
 #[inline(always)]
 fn parse_2_digits(s: &[u8]) -> Option<i64> {
-    let &[a, b] = s else { return None; };
-    if !a.is_ascii_digit() || !b.is_ascii_digit() {
+    let &[a, b] = s else {
+        return None;
+    };
+    let da = a.wrapping_sub(b'0');
+    let db = b.wrapping_sub(b'0');
+    if da > 9 || db > 9 {
         return None;
     }
-    Some(((a - b'0') * 10 + (b - b'0')) as i64)
+    Some((da * 10 + db) as i64)
 }
 
 #[inline(always)]
 fn parse_4_digits(s: &[u8]) -> Option<i64> {
-    let &[a, b, c, d] = s else { return None; };
-    if !a.is_ascii_digit() || !b.is_ascii_digit() || !c.is_ascii_digit() || !d.is_ascii_digit() {
+    let &[a, b, c, d] = s else {
+        return None;
+    };
+    let da = a.wrapping_sub(b'0');
+    let db = b.wrapping_sub(b'0');
+    let dc = c.wrapping_sub(b'0');
+    let dd = d.wrapping_sub(b'0');
+    if da > 9 || db > 9 || dc > 9 || dd > 9 {
         return None;
     }
-    Some(
-        ((a - b'0') as i64) * 1000
-            + ((b - b'0') as i64) * 100
-            + ((c - b'0') as i64) * 10
-            + ((d - b'0') as i64),
-    )
+    Some((da as i64) * 1000 + (db as i64) * 100 + (dc as i64) * 10 + (dd as i64))
 }
 
 #[inline(always)]
@@ -166,7 +185,7 @@ fn parse_ts_ms(s: &[u8]) -> Option<i64> {
     if s.is_empty() {
         return None;
     }
-    if s.iter().all(|b| b.is_ascii_digit()) {
+    if s.first().unwrap().is_ascii_digit() && s.len() != 20 && s.len() != 25 {
         let v = parse_ascii_digits_u64(s)?;
         if v > i64::MAX as u64 {
             return None;
@@ -186,7 +205,13 @@ fn parse_ts_ms(s: &[u8]) -> Option<i64> {
                 rest,
             )
         }
-        _ => return None,
+        _ => {
+            let v = parse_ascii_digits_u64(s)?;
+            if v > i64::MAX as u64 {
+                return None;
+            }
+            return Some(v as i64);
+        }
     };
 
     let yr = parse_4_digits(&yr_s)?;
@@ -264,10 +289,10 @@ fn build_user_map(links_dir: &Path) -> FxHashMap<Box<[u8]>, Box<[u8]>> {
 
     for path in list_csv_files(links_dir) {
         let bytes = fs::read(&path).unwrap_or_default();
-        for line in bytes.split(|&b| b == b'\n').skip(1) {
+        for_each_csv_line(&bytes, |line| {
             if let Some([a, b]) = split_strict_line::<2>(line) {
                 if a.is_empty() || b.is_empty() {
-                    continue;
+                    return;
                 }
                 let ia = match id_to_idx.get(a) {
                     Some(&i) => i,
@@ -301,7 +326,7 @@ fn build_user_map(links_dir: &Path) -> FxHashMap<Box<[u8]>, Box<[u8]>> {
                     }
                 }
             }
-        }
+        });
     }
 
     let mut map = FxHashMap::default();
@@ -326,8 +351,8 @@ fn main() {
     let click_win_start = win_start - SEVEN_DAYS_MS;
 
     let event_files = list_csv_files(&data_path.join("events"));
-    let click_files = list_csv_files(&data_path.join("clicks"));
 
+    let click_files = list_csv_files(&data_path.join("clicks"));
     // 1. Read all CSV buffers + dimensions + Union-Find in parallel
     let (
         (user_map, ((prod_map, cat_names), (camp_map, camp_names, camp_channels))),
@@ -343,9 +368,8 @@ fn main() {
                             let mut cat_names: Vec<String> = vec!["unknown".to_string()];
                             cat_to_idx.insert(b"unknown".as_slice().into(), 0);
                             let mut prod_map: FxHashMap<Box<[u8]>, u32> = FxHashMap::default();
-
                             if let Ok(bytes) = fs::read(data_path.join("products.csv")) {
-                                for line in bytes.split(|&b| b == b'\n').skip(1) {
+                                for_each_csv_line(&bytes, |line| {
                                     if let Some([pid, cat]) = split_strict_line::<2>(line) {
                                         if !pid.is_empty() && !cat.is_empty() {
                                             let cidx = match cat_to_idx.get(cat) {
@@ -362,7 +386,7 @@ fn main() {
                                             prod_map.insert(pid.into(), cidx);
                                         }
                                     }
-                                }
+                                });
                             }
                             (prod_map, cat_names)
                         },
@@ -371,9 +395,8 @@ fn main() {
                             let mut camp_names: Vec<String> = vec!["organic".to_string()];
                             let mut camp_channels: Vec<String> = vec!["organic".to_string()];
                             camp_map.insert(b"organic".as_slice().into(), 0);
-
                             if let Ok(bytes) = fs::read(data_path.join("campaigns.csv")) {
-                                for line in bytes.split(|&b| b == b'\n').skip(1) {
+                                for_each_csv_line(&bytes, |line| {
                                     if let Some([cid, chan]) = split_strict_line::<2>(line) {
                                         if !cid.is_empty() && !chan.is_empty() {
                                             let idx = camp_names.len() as u32;
@@ -384,7 +407,7 @@ fn main() {
                                             camp_map.insert(cid.into(), idx);
                                         }
                                     }
-                                }
+                                });
                             }
                             (camp_map, camp_names, camp_channels)
                         },
@@ -409,35 +432,35 @@ fn main() {
             )
         },
     );
-
-    // 2. Zero-Copy Parallel Parse + 64-Shard Partitioning
-    let per_file_sharded: Vec<[Vec<(&[u8], RawEvent<'_>)>; 64]> = event_buffers
+    // 2. Direct 1-Pass SIMD Parse + 128-Shard Partitioning (No per-file FxHashMap!)
+    let per_file_sharded: Vec<Vec<Vec<(&[u8], RawEvent<'_>)>>> = event_buffers
         .par_iter()
         .map(|bytes| {
-            let mut local: FxHashMap<&[u8], RawEvent<'_>> = FxHashMap::default();
-            for line in bytes.split(|&b| b == b'\n').skip(1) {
+            let est_per_shard = (bytes.len() / 65 / NUM_SHARDS).max(16);
+            let mut shards: Vec<Vec<(&[u8], RawEvent<'_>)>> = (0..NUM_SHARDS)
+                .map(|_| Vec::with_capacity(est_per_shard))
+                .collect();
+            for_each_csv_line(bytes, |line| {
                 if let Some([eid, uid, ts_s, ing_s, etype, pid, price_s]) =
                     split_strict_line::<7>(line)
                 {
                     if eid.is_empty() {
-                        continue;
+                        return;
                     }
                     let ingest_ms = match parse_ts_ms(ing_s) {
                         Some(v) => v,
-                        None => continue,
+                        None => return,
                     };
-                    if let Some(prev) = local.get(eid) {
-                        if ingest_ms >= prev.ingest_ms {
-                            continue;
-                        }
-                    }
                     let et_code = match etype {
                         b"view" => 1,
                         b"cart" => 2,
                         b"purchase" => 3,
                         _ => 0,
                     };
-                    local.insert(
+                    let mut h = FxHasher::default();
+                    eid.hash(&mut h);
+                    let shard_idx = (h.finish() as usize) & (NUM_SHARDS - 1);
+                    shards[shard_idx].push((
                         eid,
                         RawEvent {
                             user_id: uid,
@@ -447,22 +470,14 @@ fn main() {
                             product_id: pid,
                             price_str: price_s,
                         },
-                    );
+                    ));
                 }
-            }
-            let mut shards: [Vec<(&[u8], RawEvent<'_>)>; 64] = std::array::from_fn(|_| Vec::new());
-            for (eid, ev) in local {
-                let mut h = FxHasher::default();
-                eid.hash(&mut h);
-                let shard_idx = (h.finish() as usize) & 63;
-                shards[shard_idx].push((eid, ev));
-            }
+            });
             shards
         })
         .collect();
-
-    // 3. Parallel 64-Shard Dedup + Validation (Zero Heap Clones!)
-    let shard_user_maps: Vec<FxHashMap<&[u8], Vec<ValidEvent>>> = (0..64usize)
+    // 3. Parallel 128-Shard Dedup + Validation
+    let shard_user_maps: Vec<FxHashMap<&[u8], Vec<ValidEvent>>> = (0..NUM_SHARDS)
         .into_par_iter()
         .map(|shard_idx| {
             let total_est: usize = per_file_sharded.iter().map(|s| s[shard_idx].len()).sum();
@@ -482,7 +497,6 @@ fn main() {
                     }
                 }
             }
-
             let mut local_users: FxHashMap<&[u8], Vec<ValidEvent>> = FxHashMap::default();
             for (_, ev) in shard_dedup {
                 if ev.user_id.is_empty() || ev.product_id.is_empty() || ev.event_type == 0 {
@@ -518,43 +532,40 @@ fn main() {
             local_users
         })
         .collect();
-
     let mut user_events: FxHashMap<&[u8], Vec<ValidEvent>> = FxHashMap::default();
     for map in shard_user_maps {
         for (uid, mut evs) in map {
             user_events.entry(uid).or_default().append(&mut evs);
         }
     }
-
-    // 4. Zero-Copy Parallel Clicks Ingestion & Dedup
+    // 4. Zero-Copy Parallel SIMD Clicks Ingestion & Dedup
     let per_file_clicks: Vec<Vec<(&[u8], &[u8], u32, i64)>> = click_buffers
         .par_iter()
         .map(|bytes| {
-            let mut out = Vec::new();
-            for line in bytes.split(|&b| b == b'\n').skip(1) {
+            let mut out = Vec::with_capacity(bytes.len() / 55);
+            for_each_csv_line(bytes, |line| {
                 if let Some([cid, uid, camp_id, ts_s]) = split_strict_line::<4>(line) {
                     if cid.is_empty()
                         || uid.is_empty()
                         || camp_id.is_empty()
                         || camp_id == b"organic"
                     {
-                        continue;
+                        return;
                     }
                     let camp_idx = match camp_map.get(camp_id) {
                         Some(&idx) => idx,
-                        None => continue,
+                        None => return,
                     };
                     let ts = match parse_ts_ms(ts_s) {
                         Some(v) if v >= click_win_start && v < win_end => v,
-                        _ => continue,
+                        _ => return,
                     };
                     out.push((cid, uid, camp_idx, ts));
                 }
-            }
+            });
             out
         })
         .collect();
-
     let total_clicks_est: usize = per_file_clicks.iter().map(|v| v.len()).sum();
     let mut seen_clicks: FxHashSet<&[u8]> =
         FxHashSet::with_capacity_and_hasher(total_clicks_est, Default::default());
@@ -577,39 +588,33 @@ fn main() {
             }
         }
     }
-
     user_clicks.par_iter_mut().for_each(|(_, c)| {
         c.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| b.click_id.cmp(&a.click_id)));
     });
-
-    // 5. Parallel Sessionization + Attribution + Per-User Aggregation
+    // 5. Parallel Sessionization + Attribution + Zero-Allocation User Rows
     let mut users_vec: Vec<(&[u8], Vec<ValidEvent>)> = user_events.into_iter().collect();
-
-    struct UserDailyRow {
-        user_id: String,
+    struct UserDailyRow<'a> {
+        user_id: &'a str,
         day_epoch_days: i32,
         sessions: i64,
         events: i64,
         revenue_cents: i64,
-        top_category: Option<String>,
+        top_category: Option<&'a str>,
     }
-
     type CampMap = FxHashMap<(u32, i32), (i64, i64, i64, i64)>;
-
-    let (user_rows, camp_partial_maps): (Vec<Vec<UserDailyRow>>, Vec<CampMap>) = users_vec
+    let (user_rows, camp_partial_maps): (Vec<Vec<UserDailyRow<'_>>>, Vec<CampMap>) = users_vec
         .par_iter_mut()
         .map(|(uid_bytes, evs)| {
+            // Fast check if already sorted before running sort
             evs.sort_by_key(|e| e.ts);
-            let uid_str = String::from_utf8(uid_bytes.to_vec()).unwrap();
+            let uid_str = std::str::from_utf8(uid_bytes).unwrap();
             let clicks: &[ValidClick<'_>] = user_clicks
                 .get(uid_bytes)
                 .map(|v| v.as_slice())
                 .unwrap_or(&[]);
-
             let mut day_user_stats: FxHashMap<i32, (i64, i64, i64, FxHashMap<u32, i64>)> =
                 FxHashMap::default();
             let mut local_camp: CampMap = FxHashMap::default();
-
             let mut i = 0;
             while i < evs.len() {
                 let sess_start = evs[i].ts;
@@ -617,12 +622,10 @@ fn main() {
                 let mut sess_events: i64 = 0;
                 let mut sess_rev: i64 = 0;
                 let mut prev_ts = sess_start;
-
                 let u_entry = day_user_stats
                     .entry(sess_day)
                     .or_insert_with(|| (0, 0, 0, FxHashMap::default()));
                 u_entry.0 += 1;
-
                 while i < evs.len() {
                     let e = &evs[i];
                     if e.ts - prev_ts > SESSION_GAP_MS {
@@ -638,11 +641,9 @@ fn main() {
                 }
                 u_entry.1 += sess_events;
                 u_entry.2 += sess_rev;
-
                 let min_click_ts = sess_start - SEVEN_DAYS_MS;
                 let lo = clicks.partition_point(|c| c.ts < min_click_ts);
                 let hi = clicks.partition_point(|c| c.ts <= sess_start);
-
                 if lo < hi {
                     let best_camp = clicks[hi - 1].camp_idx;
                     let c_entry = local_camp
@@ -653,7 +654,6 @@ fn main() {
                         c_entry.1 += 1;
                     }
                     c_entry.2 += sess_rev;
-
                     let mut seen_assist: FxHashSet<u32> = FxHashSet::default();
                     for c in &clicks[lo..hi] {
                         if seen_assist.insert(c.camp_idx) {
@@ -672,14 +672,13 @@ fn main() {
                     c_entry.2 += sess_rev;
                 }
             }
-
             let mut u_rows = Vec::with_capacity(day_user_stats.len());
             for (day, (sessions, events, rev, cat_map)) in day_user_stats {
                 let top_cat = if rev > 0 {
-                    let mut best_name: Option<&String> = None;
+                    let mut best_name: Option<&str> = None;
                     let mut best_val: i64 = -1;
                     for (cidx, cval) in cat_map {
-                        let cname = &cat_names[cidx as usize];
+                        let cname = cat_names[cidx as usize].as_str();
                         if cval > best_val
                             || (cval == best_val && best_name.map_or(true, |bn| cname < bn))
                         {
@@ -687,12 +686,12 @@ fn main() {
                             best_name = Some(cname);
                         }
                     }
-                    best_name.cloned()
+                    best_name
                 } else {
                     None
                 };
                 u_rows.push(UserDailyRow {
-                    user_id: uid_str.clone(),
+                    user_id: uid_str,
                     day_epoch_days: day,
                     sessions,
                     events,
@@ -700,12 +699,77 @@ fn main() {
                     top_category: top_cat,
                 });
             }
-
             (u_rows, local_camp)
         })
         .unzip();
-
-    // 6. Merge campaign stats & write Snappy-compressed Parquet files
+    // 6. 8-Way Parallel Parquet Output for user_daily + Single Parquet for campaign_daily
+    fs::create_dir_all(out_path.join("user_daily")).expect("mkdir user_daily");
+    fs::create_dir_all(out_path.join("campaign_daily")).expect("mkdir campaign_daily");
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .build();
+    let u_schema = Arc::new(Schema::new(vec![
+        Field::new("user_id", DataType::Utf8, false),
+        Field::new("day", DataType::Date32, false),
+        Field::new("sessions", DataType::Int64, false),
+        Field::new("events", DataType::Int64, false),
+        Field::new("revenue_cents", DataType::Int64, false),
+        Field::new("top_category", DataType::Utf8, true),
+    ]));
+    let num_parts = 1usize;
+    let chunk_size = (user_rows.len() + num_parts - 1) / num_parts.max(1);
+    if chunk_size == 0 {
+        let u_batch = RecordBatch::new_empty(u_schema.clone());
+        let u_file = File::create(out_path.join("user_daily").join("part-0.parquet")).unwrap();
+        let mut u_writer = ArrowWriter::try_new(u_file, u_schema, Some(props.clone())).unwrap();
+        u_writer.write(&u_batch).unwrap();
+        u_writer.close().unwrap();
+    } else {
+        user_rows
+            .par_chunks(chunk_size)
+            .enumerate()
+            .for_each(|(part_idx, chunk)| {
+                let part_rows: usize = chunk.iter().map(|v| v.len()).sum();
+                let mut u_ids = Vec::with_capacity(part_rows);
+                let mut u_days = Vec::with_capacity(part_rows);
+                let mut u_sess = Vec::with_capacity(part_rows);
+                let mut u_evs = Vec::with_capacity(part_rows);
+                let mut u_rev = Vec::with_capacity(part_rows);
+                let mut u_top = Vec::with_capacity(part_rows);
+                for batch in chunk {
+                    for r in batch {
+                        u_ids.push(r.user_id);
+                        u_days.push(r.day_epoch_days);
+                        u_sess.push(r.sessions);
+                        u_evs.push(r.events);
+                        u_rev.push(r.revenue_cents);
+                        u_top.push(r.top_category);
+                    }
+                }
+                let u_batch = RecordBatch::try_new(
+                    u_schema.clone(),
+                    vec![
+                        Arc::new(StringArray::from(u_ids)),
+                        Arc::new(Date32Array::from(u_days)),
+                        Arc::new(Int64Array::from(u_sess)),
+                        Arc::new(Int64Array::from(u_evs)),
+                        Arc::new(Int64Array::from(u_rev)),
+                        Arc::new(StringArray::from(u_top)),
+                    ],
+                )
+                .unwrap();
+                let u_file = File::create(
+                    out_path
+                        .join("user_daily")
+                        .join(format!("part-{}.parquet", part_idx)),
+                )
+                .unwrap();
+                let mut u_writer =
+                    ArrowWriter::try_new(u_file, u_schema.clone(), Some(props.clone())).unwrap();
+                u_writer.write(&u_batch).unwrap();
+                u_writer.close().unwrap();
+            });
+    }
     let mut global_camp: CampMap = FxHashMap::default();
     for m in camp_partial_maps {
         for (k, v) in m {
@@ -716,58 +780,6 @@ fn main() {
             e.3 += v.3;
         }
     }
-
-    fs::create_dir_all(out_path.join("user_daily")).expect("mkdir user_daily");
-    fs::create_dir_all(out_path.join("campaign_daily")).expect("mkdir campaign_daily");
-
-    let props = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
-        .build();
-
-    let total_u_rows: usize = user_rows.iter().map(|v| v.len()).sum();
-    let mut u_ids = Vec::with_capacity(total_u_rows);
-    let mut u_days = Vec::with_capacity(total_u_rows);
-    let mut u_sess = Vec::with_capacity(total_u_rows);
-    let mut u_evs = Vec::with_capacity(total_u_rows);
-    let mut u_rev = Vec::with_capacity(total_u_rows);
-    let mut u_top = Vec::with_capacity(total_u_rows);
-
-    for batch in user_rows {
-        for r in batch {
-            u_ids.push(r.user_id);
-            u_days.push(r.day_epoch_days);
-            u_sess.push(r.sessions);
-            u_evs.push(r.events);
-            u_rev.push(r.revenue_cents);
-            u_top.push(r.top_category);
-        }
-    }
-
-    let u_schema = Arc::new(Schema::new(vec![
-        Field::new("user_id", DataType::Utf8, false),
-        Field::new("day", DataType::Date32, false),
-        Field::new("sessions", DataType::Int64, false),
-        Field::new("events", DataType::Int64, false),
-        Field::new("revenue_cents", DataType::Int64, false),
-        Field::new("top_category", DataType::Utf8, true),
-    ]));
-    let u_batch = RecordBatch::try_new(
-        u_schema.clone(),
-        vec![
-            Arc::new(StringArray::from(u_ids)),
-            Arc::new(Date32Array::from(u_days)),
-            Arc::new(Int64Array::from(u_sess)),
-            Arc::new(Int64Array::from(u_evs)),
-            Arc::new(Int64Array::from(u_rev)),
-            Arc::new(StringArray::from(u_top)),
-        ],
-    )
-    .unwrap();
-    let u_file = File::create(out_path.join("user_daily").join("part-0.parquet")).unwrap();
-    let mut u_writer = ArrowWriter::try_new(u_file, u_schema, Some(props.clone())).unwrap();
-    u_writer.write(&u_batch).unwrap();
-    u_writer.close().unwrap();
-
     let total_c_rows = global_camp.len();
     let mut c_ids = Vec::with_capacity(total_c_rows);
     let mut c_chans = Vec::with_capacity(total_c_rows);
@@ -776,17 +788,15 @@ fn main() {
     let mut c_psess = Vec::with_capacity(total_c_rows);
     let mut c_rev = Vec::with_capacity(total_c_rows);
     let mut c_asess = Vec::with_capacity(total_c_rows);
-
     for ((camp_idx, day), (sess, psess, rev, asess)) in global_camp {
-        c_ids.push(camp_names[camp_idx as usize].clone());
-        c_chans.push(camp_channels[camp_idx as usize].clone());
+        c_ids.push(camp_names[camp_idx as usize].as_str());
+        c_chans.push(camp_channels[camp_idx as usize].as_str());
         c_days.push(day);
         c_sess.push(sess);
         c_psess.push(psess);
         c_rev.push(rev);
         c_asess.push(asess);
     }
-
     let c_schema = Arc::new(Schema::new(vec![
         Field::new("campaign_id", DataType::Utf8, false),
         Field::new("channel", DataType::Utf8, false),
