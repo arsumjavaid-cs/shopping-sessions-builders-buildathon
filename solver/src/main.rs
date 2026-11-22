@@ -1,15 +1,17 @@
 use arrow::array::{Date32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use mimalloc::MiMalloc;
 use parquet::arrow::ArrowWriter;
+use parquet::basic::Compression;
+use parquet::file::properties::WriterProperties;
 use rayon::prelude::*;
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use serde::Deserialize;
 use std::fs::{self, File};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use mimalloc::MiMalloc;
-use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
-use std::hash::{Hash, Hasher};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -24,17 +26,17 @@ struct Manifest {
     window_end: String,
 }
 
-#[derive(Clone)]
-struct RawEvent {
-    user_id: Box<[u8]>,
-    ts_str: Box<[u8]>,
+#[derive(Clone, Copy)]
+struct RawEvent<'a> {
+    user_id: &'a [u8],
+    ts_str: &'a [u8],
     ingest_ms: i64,
-    event_type: u8, // 1=view, 2=cart, 3=purchase
-    product_id: Box<[u8]>,
-    price_str: Box<[u8]>,
+    event_type: u8,
+    product_id: &'a [u8],
+    price_str: &'a [u8],
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct ValidEvent {
     ts: i64,
     event_type: u8,
@@ -42,10 +44,10 @@ struct ValidEvent {
     price_cents: i64,
 }
 
-#[derive(Clone)]
-struct ValidClick {
+#[derive(Clone, Copy)]
+struct ValidClick<'a> {
     ts: i64,
-    click_id: Box<[u8]>,
+    click_id: &'a [u8],
     camp_idx: u32,
 }
 
@@ -65,6 +67,7 @@ fn parse_strict_field(f: &[u8]) -> Option<&[u8]> {
     }
 }
 
+#[inline(always)]
 fn split_strict_line<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     if line.is_empty() {
         return None;
@@ -74,7 +77,7 @@ fn split_strict_line<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     let mut start = 0;
     for (i, &b) in line.iter().enumerate() {
         if b == b',' {
-            if idx >= N {
+            if idx >= N - 1 {
                 return None;
             }
             out[idx] = parse_strict_field(&line[start..i])?;
@@ -106,22 +109,24 @@ fn parse_ascii_digits_u64(s: &[u8]) -> Option<u64> {
 
 #[inline(always)]
 fn parse_2_digits(s: &[u8]) -> Option<i64> {
-    if s.len() != 2 || !s[0].is_ascii_digit() || !s[1].is_ascii_digit() {
+    let &[a, b] = s else { return None; };
+    if !a.is_ascii_digit() || !b.is_ascii_digit() {
         return None;
     }
-    Some(((s[0] - b'0') * 10 + (s[1] - b'0')) as i64)
+    Some(((a - b'0') * 10 + (b - b'0')) as i64)
 }
 
 #[inline(always)]
 fn parse_4_digits(s: &[u8]) -> Option<i64> {
-    if s.len() != 4 || !s.iter().all(|b| b.is_ascii_digit()) {
+    let &[a, b, c, d] = s else { return None; };
+    if !a.is_ascii_digit() || !b.is_ascii_digit() || !c.is_ascii_digit() || !d.is_ascii_digit() {
         return None;
     }
     Some(
-        ((s[0] - b'0') as i64) * 1000
-            + ((s[1] - b'0') as i64) * 100
-            + ((s[2] - b'0') as i64) * 10
-            + ((s[3] - b'0') as i64),
+        ((a - b'0') as i64) * 1000
+            + ((b - b'0') as i64) * 100
+            + ((c - b'0') as i64) * 10
+            + ((d - b'0') as i64),
     )
 }
 
@@ -149,18 +154,18 @@ fn days_in_month(y: i64, m: i64) -> i64 {
 #[inline(always)]
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = y - if m <= 2 { 1 } else { 0 };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
     let yoe = y - era * 400;
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146097 + doe - 719468
 }
 
+#[inline]
 fn parse_ts_ms(s: &[u8]) -> Option<i64> {
     if s.is_empty() {
         return None;
     }
-    // F3: digits only
     if s.iter().all(|b| b.is_ascii_digit()) {
         let v = parse_ascii_digits_u64(s)?;
         if v > i64::MAX as u64 {
@@ -168,24 +173,34 @@ fn parse_ts_ms(s: &[u8]) -> Option<i64> {
         }
         return Some(v as i64);
     }
-    // F1 (len 20) or F2 (len 25)
-    if (s.len() != 20 && s.len() != 25)
-        || s[4] != b'-'
-        || s[7] != b'-'
-        || s[10] != b'T'
-        || s[13] != b':'
-        || s[16] != b':'
-    {
-        return None;
-    }
-    let yr = parse_4_digits(&s[0..4])?;
-    let mo = parse_2_digits(&s[5..7])?;
-    let dy = parse_2_digits(&s[8..10])?;
-    let hr = parse_2_digits(&s[11..13])?;
-    let mi = parse_2_digits(&s[14..16])?;
-    let sc = parse_2_digits(&s[17..19])?;
 
-    if !(1..=12).contains(&mo) || !(0..=23).contains(&hr) || !(0..=59).contains(&mi) || !(0..=59).contains(&sc) {
+    let (yr_s, mo_s, dy_s, hr_s, mi_s, sc_s, tail) = match s {
+        [y1, y2, y3, y4, b'-', m1, m2, b'-', d1, d2, b'T', h1, h2, b':', min1, min2, b':', s1, s2, rest @ ..] => {
+            (
+                [*y1, *y2, *y3, *y4],
+                [*m1, *m2],
+                [*d1, *d2],
+                [*h1, *h2],
+                [*min1, *min2],
+                [*s1, *s2],
+                rest,
+            )
+        }
+        _ => return None,
+    };
+
+    let yr = parse_4_digits(&yr_s)?;
+    let mo = parse_2_digits(&mo_s)?;
+    let dy = parse_2_digits(&dy_s)?;
+    let hr = parse_2_digits(&hr_s)?;
+    let mi = parse_2_digits(&mi_s)?;
+    let sc = parse_2_digits(&sc_s)?;
+
+    if !(1..=12).contains(&mo)
+        || !(0..=23).contains(&hr)
+        || !(0..=59).contains(&mi)
+        || !(0..=59).contains(&sc)
+    {
         return None;
     }
     let max_d = days_in_month(yr, mo);
@@ -195,26 +210,22 @@ fn parse_ts_ms(s: &[u8]) -> Option<i64> {
 
     let mut total_sec = days_from_civil(yr, mo, dy) * 86_400 + hr * 3600 + mi * 60 + sc;
 
-    if s.len() == 20 {
-        if s[19] != b'Z' {
-            return None;
+    match tail {
+        [b'Z'] => {}
+        [sign @ (b'+' | b'-'), oh1, oh2, b':', om1, om2] => {
+            let off_h = parse_2_digits(&[*oh1, *oh2])?;
+            let off_m = parse_2_digits(&[*om1, *om2])?;
+            if !(0..=23).contains(&off_h) || !(0..=59).contains(&off_m) {
+                return None;
+            }
+            let off_sec = off_h * 3600 + off_m * 60;
+            if *sign == b'+' {
+                total_sec -= off_sec;
+            } else {
+                total_sec += off_sec;
+            }
         }
-    } else {
-        let sign = s[19];
-        if (sign != b'+' && sign != b'-') || s[22] != b':' {
-            return None;
-        }
-        let off_h = parse_2_digits(&s[20..22])?;
-        let off_m = parse_2_digits(&s[23..25])?;
-        if !(0..=23).contains(&off_h) || !(0..=59).contains(&off_m) {
-            return None;
-        }
-        let off_sec = off_h * 3600 + off_m * 60;
-        if sign == b'+' {
-            total_sec -= off_sec;
-        } else {
-            total_sec += off_sec;
-        }
+        _ => return None,
     }
     Some(total_sec * 1000)
 }
@@ -314,70 +325,100 @@ fn main() {
     let win_end = parse_ts_ms(manifest.window_end.as_bytes()).expect("win_end");
     let click_win_start = win_start - SEVEN_DAYS_MS;
 
-    // 1. Load dimensions + Union-Find in parallel
-            let (user_map, ((prod_map, cat_names), (camp_map, camp_names, camp_channels))) = rayon::join(
-        || build_user_map(&data_path.join("links")),
+    let event_files = list_csv_files(&data_path.join("events"));
+    let click_files = list_csv_files(&data_path.join("clicks"));
+
+    // 1. Read all CSV buffers + dimensions + Union-Find in parallel
+    let (
+        (user_map, ((prod_map, cat_names), (camp_map, camp_names, camp_channels))),
+        (event_buffers, click_buffers),
+    ) = rayon::join(
+        || {
+            rayon::join(
+                || build_user_map(&data_path.join("links")),
+                || {
+                    rayon::join(
+                        || {
+                            let mut cat_to_idx: FxHashMap<Box<[u8]>, u32> = FxHashMap::default();
+                            let mut cat_names: Vec<String> = vec!["unknown".to_string()];
+                            cat_to_idx.insert(b"unknown".as_slice().into(), 0);
+                            let mut prod_map: FxHashMap<Box<[u8]>, u32> = FxHashMap::default();
+
+                            if let Ok(bytes) = fs::read(data_path.join("products.csv")) {
+                                for line in bytes.split(|&b| b == b'\n').skip(1) {
+                                    if let Some([pid, cat]) = split_strict_line::<2>(line) {
+                                        if !pid.is_empty() && !cat.is_empty() {
+                                            let cidx = match cat_to_idx.get(cat) {
+                                                Some(&i) => i,
+                                                None => {
+                                                    let i = cat_names.len() as u32;
+                                                    cat_names.push(
+                                                        String::from_utf8(cat.to_vec()).unwrap(),
+                                                    );
+                                                    cat_to_idx.insert(cat.into(), i);
+                                                    i
+                                                }
+                                            };
+                                            prod_map.insert(pid.into(), cidx);
+                                        }
+                                    }
+                                }
+                            }
+                            (prod_map, cat_names)
+                        },
+                        || {
+                            let mut camp_map: FxHashMap<Box<[u8]>, u32> = FxHashMap::default();
+                            let mut camp_names: Vec<String> = vec!["organic".to_string()];
+                            let mut camp_channels: Vec<String> = vec!["organic".to_string()];
+                            camp_map.insert(b"organic".as_slice().into(), 0);
+
+                            if let Ok(bytes) = fs::read(data_path.join("campaigns.csv")) {
+                                for line in bytes.split(|&b| b == b'\n').skip(1) {
+                                    if let Some([cid, chan]) = split_strict_line::<2>(line) {
+                                        if !cid.is_empty() && !chan.is_empty() {
+                                            let idx = camp_names.len() as u32;
+                                            camp_names
+                                                .push(String::from_utf8(cid.to_vec()).unwrap());
+                                            camp_channels
+                                                .push(String::from_utf8(chan.to_vec()).unwrap());
+                                            camp_map.insert(cid.into(), idx);
+                                        }
+                                    }
+                                }
+                            }
+                            (camp_map, camp_names, camp_channels)
+                        },
+                    )
+                },
+            )
+        },
         || {
             rayon::join(
                 || {
-                    let mut cat_to_idx: FxHashMap<Box<[u8]>, u32> = FxHashMap::default();
-                    let mut cat_names: Vec<String> = vec!["unknown".to_string()];
-                    cat_to_idx.insert(b"unknown".as_slice().into(), 0);
-                    let mut prod_map: FxHashMap<Box<[u8]>, u32> = FxHashMap::default();
-
-                    if let Ok(bytes) = fs::read(data_path.join("products.csv")) {
-                        for line in bytes.split(|&b| b == b'\n').skip(1) {
-                            if let Some([pid, cat]) = split_strict_line::<2>(line) {
-                                if !pid.is_empty() && !cat.is_empty() {
-                                    let cidx = match cat_to_idx.get(cat) {
-                                        Some(&i) => i,
-                                        None => {
-                                            let i = cat_names.len() as u32;
-                                            cat_names.push(String::from_utf8(cat.to_vec()).unwrap());
-                                            cat_to_idx.insert(cat.into(), i);
-                                            i
-                                        }
-                                    };
-                                    prod_map.insert(pid.into(), cidx);
-                                }
-                            }
-                        }
-                    }
-                    (prod_map, cat_names)
+                    event_files
+                        .par_iter()
+                        .map(|p| fs::read(p).unwrap_or_default())
+                        .collect::<Vec<Vec<u8>>>()
                 },
                 || {
-                    let mut camp_map: FxHashMap<Box<[u8]>, u32> = FxHashMap::default();
-                    let mut camp_names: Vec<String> = vec!["organic".to_string()];
-                    let mut camp_channels: Vec<String> = vec!["organic".to_string()];
-                    camp_map.insert(b"organic".as_slice().into(), 0);
-
-                    if let Ok(bytes) = fs::read(data_path.join("campaigns.csv")) {
-                        for line in bytes.split(|&b| b == b'\n').skip(1) {
-                            if let Some([cid, chan]) = split_strict_line::<2>(line) {
-                                if !cid.is_empty() && !chan.is_empty() {
-                                    let idx = camp_names.len() as u32;
-                                    camp_names.push(String::from_utf8(cid.to_vec()).unwrap());
-                                    camp_channels.push(String::from_utf8(chan.to_vec()).unwrap());
-                                    camp_map.insert(cid.into(), idx);
-                                }
-                            }
-                        }
-                    }
-                    (camp_map, camp_names, camp_channels)
+                    click_files
+                        .par_iter()
+                        .map(|p| fs::read(p).unwrap_or_default())
+                        .collect::<Vec<Vec<u8>>>()
                 },
             )
         },
     );
 
-        // 2. Parallel Events Ingestion -> 16-Shard Parallel Dedup & Validation
-    let event_files = list_csv_files(&data_path.join("events"));
-    let per_file_sharded: Vec<[Vec<(Box<[u8]>, RawEvent)>; 16]> = event_files
+    // 2. Zero-Copy Parallel Parse + 64-Shard Partitioning
+    let per_file_sharded: Vec<[Vec<(&[u8], RawEvent<'_>)>; 64]> = event_buffers
         .par_iter()
-        .map(|path| {
-            let mut local: FxHashMap<Box<[u8]>, RawEvent> = FxHashMap::default();
-            let bytes = fs::read(path).unwrap_or_default();
+        .map(|bytes| {
+            let mut local: FxHashMap<&[u8], RawEvent<'_>> = FxHashMap::default();
             for line in bytes.split(|&b| b == b'\n').skip(1) {
-                if let Some([eid, uid, ts_s, ing_s, etype, pid, price_s]) = split_strict_line::<7>(line) {
+                if let Some([eid, uid, ts_s, ing_s, etype, pid, price_s]) =
+                    split_strict_line::<7>(line)
+                {
                     if eid.is_empty() {
                         continue;
                     }
@@ -397,55 +438,57 @@ fn main() {
                         _ => 0,
                     };
                     local.insert(
-                        eid.into(),
+                        eid,
                         RawEvent {
-                            user_id: uid.into(),
-                            ts_str: ts_s.into(),
+                            user_id: uid,
+                            ts_str: ts_s,
                             ingest_ms,
                             event_type: et_code,
-                            product_id: pid.into(),
-                            price_str: price_s.into(),
+                            product_id: pid,
+                            price_str: price_s,
                         },
                     );
                 }
             }
-            let mut shards: [Vec<(Box<[u8]>, RawEvent)>; 16] = std::array::from_fn(|_| Vec::new());
+            let mut shards: [Vec<(&[u8], RawEvent<'_>)>; 64] = std::array::from_fn(|_| Vec::new());
             for (eid, ev) in local {
                 let mut h = FxHasher::default();
                 eid.hash(&mut h);
-                let shard_idx = (h.finish() as usize) & 15;
+                let shard_idx = (h.finish() as usize) & 63;
                 shards[shard_idx].push((eid, ev));
             }
             shards
         })
         .collect();
 
-    // Process all 16 shards across all CPU cores in parallel (dedup + validate)
-    let shard_user_maps: Vec<FxHashMap<Box<[u8]>, Vec<ValidEvent>>> = (0..16usize)
+    // 3. Parallel 64-Shard Dedup + Validation (Zero Heap Clones!)
+    let shard_user_maps: Vec<FxHashMap<&[u8], Vec<ValidEvent>>> = (0..64usize)
         .into_par_iter()
         .map(|shard_idx| {
-            let mut shard_dedup: FxHashMap<Box<[u8]>, RawEvent> = FxHashMap::default();
+            let total_est: usize = per_file_sharded.iter().map(|s| s[shard_idx].len()).sum();
+            let mut shard_dedup: FxHashMap<&[u8], RawEvent<'_>> =
+                FxHashMap::with_capacity_and_hasher(total_est, Default::default());
             for file_shards in &per_file_sharded {
-                for (eid, ev) in &file_shards[shard_idx] {
+                for &(eid, ev) in &file_shards[shard_idx] {
                     match shard_dedup.get_mut(eid) {
                         Some(prev) => {
                             if ev.ingest_ms < prev.ingest_ms {
-                                *prev = ev.clone();
+                                *prev = ev;
                             }
                         }
                         None => {
-                            shard_dedup.insert(eid.clone(), ev.clone());
+                            shard_dedup.insert(eid, ev);
                         }
                     }
                 }
             }
 
-            let mut local_users: FxHashMap<Box<[u8]>, Vec<ValidEvent>> = FxHashMap::default();
+            let mut local_users: FxHashMap<&[u8], Vec<ValidEvent>> = FxHashMap::default();
             for (_, ev) in shard_dedup {
                 if ev.user_id.is_empty() || ev.product_id.is_empty() || ev.event_type == 0 {
                     continue;
                 }
-                let ts = match parse_ts_ms(&ev.ts_str) {
+                let ts = match parse_ts_ms(ev.ts_str) {
                     Some(v) if v >= win_start && v < win_end => v,
                     _ => continue,
                 };
@@ -454,14 +497,17 @@ fn main() {
                 }
                 let mut price_cents: i64 = 0;
                 if ev.event_type == 3 {
-                    let p = match parse_ascii_digits_u64(&ev.price_str) {
+                    let p = match parse_ascii_digits_u64(ev.price_str) {
                         Some(v) if (1..=10_000_000).contains(&v) => v as i64,
                         _ => continue,
                     };
                     price_cents = p;
                 }
-                let cat_idx = *prod_map.get(&ev.product_id).unwrap_or(&0);
-                let canon_uid = user_map.get(&ev.user_id).cloned().unwrap_or(ev.user_id);
+                let cat_idx = *prod_map.get(ev.product_id).unwrap_or(&0);
+                let canon_uid: &[u8] = match user_map.get(ev.user_id) {
+                    Some(b) => b.as_ref(),
+                    None => ev.user_id,
+                };
                 local_users.entry(canon_uid).or_default().push(ValidEvent {
                     ts,
                     event_type: ev.event_type,
@@ -473,23 +519,25 @@ fn main() {
         })
         .collect();
 
-    let mut user_events: FxHashMap<Box<[u8]>, Vec<ValidEvent>> = FxHashMap::default();
+    let mut user_events: FxHashMap<&[u8], Vec<ValidEvent>> = FxHashMap::default();
     for map in shard_user_maps {
         for (uid, mut evs) in map {
             user_events.entry(uid).or_default().append(&mut evs);
         }
     }
 
-    // 4. Parallel Clicks Ingestion, Dedup & Validation
-    let click_files = list_csv_files(&data_path.join("clicks"));
-    let per_file_clicks: Vec<Vec<(Box<[u8]>, Box<[u8]>, u32, i64)>> = click_files
+    // 4. Zero-Copy Parallel Clicks Ingestion & Dedup
+    let per_file_clicks: Vec<Vec<(&[u8], &[u8], u32, i64)>> = click_buffers
         .par_iter()
-        .map(|path| {
+        .map(|bytes| {
             let mut out = Vec::new();
-            let bytes = fs::read(path).unwrap_or_default();
             for line in bytes.split(|&b| b == b'\n').skip(1) {
                 if let Some([cid, uid, camp_id, ts_s]) = split_strict_line::<4>(line) {
-                    if cid.is_empty() || uid.is_empty() || camp_id.is_empty() || camp_id == b"organic" {
+                    if cid.is_empty()
+                        || uid.is_empty()
+                        || camp_id.is_empty()
+                        || camp_id == b"organic"
+                    {
                         continue;
                     }
                     let camp_idx = match camp_map.get(camp_id) {
@@ -500,22 +548,27 @@ fn main() {
                         Some(v) if v >= click_win_start && v < win_end => v,
                         _ => continue,
                     };
-                    out.push((cid.into(), uid.into(), camp_idx, ts));
+                    out.push((cid, uid, camp_idx, ts));
                 }
             }
             out
         })
         .collect();
 
-    let mut seen_clicks: FxHashSet<Box<[u8]>> = FxHashSet::default();
-    let mut user_clicks: FxHashMap<Box<[u8]>, Vec<ValidClick>> = FxHashMap::default();
+    let total_clicks_est: usize = per_file_clicks.iter().map(|v| v.len()).sum();
+    let mut seen_clicks: FxHashSet<&[u8]> =
+        FxHashSet::with_capacity_and_hasher(total_clicks_est, Default::default());
+    let mut user_clicks: FxHashMap<&[u8], Vec<ValidClick<'_>>> = FxHashMap::default();
     for batch in per_file_clicks {
         for (cid, raw_uid, camp_idx, ts) in batch {
-            if !seen_clicks.insert(cid.clone()) {
+            if !seen_clicks.insert(cid) {
                 continue;
             }
-            let canon_uid = user_map.get(&raw_uid).cloned().unwrap_or(raw_uid);
-            if user_events.contains_key(&canon_uid) {
+            let canon_uid: &[u8] = match user_map.get(raw_uid) {
+                Some(b) => b.as_ref(),
+                None => raw_uid,
+            };
+            if user_events.contains_key(canon_uid) {
                 user_clicks.entry(canon_uid).or_default().push(ValidClick {
                     ts,
                     click_id: cid,
@@ -526,11 +579,11 @@ fn main() {
     }
 
     user_clicks.par_iter_mut().for_each(|(_, c)| {
-    c.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| b.click_id.cmp(&a.click_id)));
-});
+        c.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| b.click_id.cmp(&a.click_id)));
+    });
 
     // 5. Parallel Sessionization + Attribution + Per-User Aggregation
-    let mut users_vec: Vec<(Box<[u8]>, Vec<ValidEvent>)> = user_events.into_iter().collect();
+    let mut users_vec: Vec<(&[u8], Vec<ValidEvent>)> = user_events.into_iter().collect();
 
     struct UserDailyRow {
         user_id: String,
@@ -548,10 +601,13 @@ fn main() {
         .map(|(uid_bytes, evs)| {
             evs.sort_by_key(|e| e.ts);
             let uid_str = String::from_utf8(uid_bytes.to_vec()).unwrap();
+            let clicks: &[ValidClick<'_>] = user_clicks
+                .get(uid_bytes)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
 
-            let clicks: &[ValidClick] = user_clicks.get(uid_bytes).map(|v| v.as_slice()).unwrap_or(&[]);
-
-            let mut day_user_stats: FxHashMap<i32, (i64, i64, i64, FxHashMap<u32, i64>)> = FxHashMap::default();
+            let mut day_user_stats: FxHashMap<i32, (i64, i64, i64, FxHashMap<u32, i64>)> =
+                FxHashMap::default();
             let mut local_camp: CampMap = FxHashMap::default();
 
             let mut i = 0;
@@ -589,7 +645,9 @@ fn main() {
 
                 if lo < hi {
                     let best_camp = clicks[hi - 1].camp_idx;
-                    let c_entry = local_camp.entry((best_camp, sess_day)).or_insert((0, 0, 0, 0));
+                    let c_entry = local_camp
+                        .entry((best_camp, sess_day))
+                        .or_insert((0, 0, 0, 0));
                     c_entry.0 += 1;
                     if sess_rev > 0 {
                         c_entry.1 += 1;
@@ -599,7 +657,10 @@ fn main() {
                     let mut seen_assist: FxHashSet<u32> = FxHashSet::default();
                     for c in &clicks[lo..hi] {
                         if seen_assist.insert(c.camp_idx) {
-                            local_camp.entry((c.camp_idx, sess_day)).or_insert((0, 0, 0, 0)).3 += 1;
+                            local_camp
+                                .entry((c.camp_idx, sess_day))
+                                .or_insert((0, 0, 0, 0))
+                                .3 += 1;
                         }
                     }
                 } else {
@@ -619,7 +680,9 @@ fn main() {
                     let mut best_val: i64 = -1;
                     for (cidx, cval) in cat_map {
                         let cname = &cat_names[cidx as usize];
-                        if cval > best_val || (cval == best_val && best_name.map_or(true, |bn| cname < bn)) {
+                        if cval > best_val
+                            || (cval == best_val && best_name.map_or(true, |bn| cname < bn))
+                        {
                             best_val = cval;
                             best_name = Some(cname);
                         }
@@ -642,7 +705,7 @@ fn main() {
         })
         .unzip();
 
-    // 6. Merge campaign stats & write Parquet files
+    // 6. Merge campaign stats & write Snappy-compressed Parquet files
     let mut global_camp: CampMap = FxHashMap::default();
     for m in camp_partial_maps {
         for (k, v) in m {
@@ -656,6 +719,10 @@ fn main() {
 
     fs::create_dir_all(out_path.join("user_daily")).expect("mkdir user_daily");
     fs::create_dir_all(out_path.join("campaign_daily")).expect("mkdir campaign_daily");
+
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .build();
 
     let total_u_rows: usize = user_rows.iter().map(|v| v.len()).sum();
     let mut u_ids = Vec::with_capacity(total_u_rows);
@@ -697,7 +764,7 @@ fn main() {
     )
     .unwrap();
     let u_file = File::create(out_path.join("user_daily").join("part-0.parquet")).unwrap();
-    let mut u_writer = ArrowWriter::try_new(u_file, u_schema, None).unwrap();
+    let mut u_writer = ArrowWriter::try_new(u_file, u_schema, Some(props.clone())).unwrap();
     u_writer.write(&u_batch).unwrap();
     u_writer.close().unwrap();
 
@@ -743,7 +810,7 @@ fn main() {
     )
     .unwrap();
     let c_file = File::create(out_path.join("campaign_daily").join("part-0.parquet")).unwrap();
-    let mut c_writer = ArrowWriter::try_new(c_file, c_schema, None).unwrap();
+    let mut c_writer = ArrowWriter::try_new(c_file, c_schema, Some(props)).unwrap();
     c_writer.write(&c_batch).unwrap();
     c_writer.close().unwrap();
 }
