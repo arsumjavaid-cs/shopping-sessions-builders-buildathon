@@ -1,4 +1,13 @@
-
+use arrow::array::{ArrayRef, Date32Array, Int64Array, StringBuilder};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use memchr::{memchr, memchr_iter};
+use mimalloc::MiMalloc;
+use parquet::arrow::ArrowWriter;
+use parquet::basic::Compression;
+use parquet::file::properties::{EnabledStatistics, WriterProperties};
+use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 use serde::Deserialize;
 use std::fs::{self, File};
 use std::os::unix::fs::FileExt;
