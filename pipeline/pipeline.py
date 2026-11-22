@@ -3,6 +3,7 @@ import json
 import os
 import duckdb
 from ingest import ingest_all
+from analytics import run_analytics
 
 DATA = os.environ.get("DATA_DIR", "/data")
 OUT = os.environ.get("OUTPUT_DIR", "/output")
@@ -24,20 +25,4 @@ con.register("events", events_tbl)
 con.register("clicks", clicks_tbl)
 con.register("campaigns", campaigns_tbl)
 
-os.makedirs(os.path.join(OUT, "user_daily"), exist_ok=True)
-os.makedirs(os.path.join(OUT, "campaign_daily"), exist_ok=True)
-con.execute(f"""
-    COPY (
-        SELECT NULL::VARCHAR AS user_id, NULL::DATE AS day, NULL::BIGINT AS sessions,
-               NULL::BIGINT AS events, NULL::BIGINT AS revenue_cents, NULL::VARCHAR AS top_category
-        WHERE false
-    ) TO '{os.path.join(OUT, "user_daily", "part-0.parquet")}' (FORMAT parquet)
-""")
-con.execute(f"""
-    COPY (
-        SELECT NULL::VARCHAR AS campaign_id, NULL::VARCHAR AS channel, NULL::DATE AS day,
-               NULL::BIGINT AS sessions, NULL::BIGINT AS purchasing_sessions, NULL::BIGINT AS revenue_cents,
-               NULL::BIGINT AS assisted_sessions
-        WHERE false
-    ) TO '{os.path.join(OUT, "campaign_daily", "part-0.parquet")}' (FORMAT parquet)
-""")
+run_analytics(con, OUT)
