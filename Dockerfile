@@ -1,6 +1,7 @@
 FROM rust:1.85-slim-bookworm AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
-COPY solver/Cargo.toml ./
+COPY solver/Cargo.toml solver/Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release && rm -rf src
 COPY solver/src ./src
 RUN touch src/main.rs && cargo build --release
